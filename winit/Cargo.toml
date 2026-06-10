@@ -42,6 +42,7 @@ sysinfo.optional = true
 arboard.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures.workspace = true
 web-sys.workspace = true
 web-sys.features = [
     "Blob",
@@ -58,7 +59,6 @@ web-sys.features = [
     "OffscreenCanvasRenderingContext2d",
     "Window",
 ]
-wasm-bindgen-futures.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mundy.workspace = true
