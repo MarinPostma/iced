@@ -297,12 +297,69 @@ impl core::text::Paragraph for Paragraph {
     }
 
     fn hit_test(&self, point: Point) -> Option<Hit> {
-        let cursor = self
-            .internal()
-            .buffer
-            .hit(point.x * self.0.hint_factor, point.y * self.0.hint_factor)?;
+        use unicode_segmentation::UnicodeSegmentation;
 
-        Some(Hit::CharOffset(cursor.index))
+        let hint = self.0.hint_factor;
+        let internal = self.internal();
+        let x = point.x * hint;
+        let y = point.y * hint;
+
+        let line_cursor = internal.buffer.hit(x, y)?;
+        let run = internal.buffer.layout_runs().nth(line_cursor.line)?;
+
+        if run.glyphs.is_empty() {
+            return Some(Hit::CharOffset(line_cursor.index));
+        }
+
+        struct GraphemeExtent {
+            start: usize,
+            end: usize,
+            min_x: f32,
+            max_right: f32,
+        }
+        let mut extents: Vec<GraphemeExtent> = Vec::new();
+        for (g_start, g_str) in run.text.grapheme_indices(true) {
+            let g_end = g_start + g_str.len();
+            let mut min_x = f32::INFINITY;
+            let mut max_right = f32::NEG_INFINITY;
+            for glyph in run.glyphs.iter() {
+                if glyph.start < g_end && glyph.end > g_start {
+                    let gx = glyph.x + glyph.x_offset * glyph.font_size;
+                    let right = gx + glyph.w;
+                    min_x = min_x.min(gx);
+                    max_right = max_right.max(right);
+                }
+            }
+            if min_x.is_finite() {
+                extents.push(GraphemeExtent {
+                    start: g_start,
+                    end: g_end,
+                    min_x,
+                    max_right,
+                });
+            }
+        }
+
+        if extents.is_empty() {
+            return Some(Hit::CharOffset(line_cursor.index));
+        }
+
+        let first = extents.first().unwrap();
+        let last = extents.last().unwrap();
+        if x <= first.min_x {
+            return Some(Hit::CharOffset(first.start));
+        }
+        if x >= last.max_right {
+            return Some(Hit::CharOffset(last.end));
+        }
+
+        let g = extents
+            .iter()
+            .find(|g| x >= g.min_x && x < g.max_right)
+            .unwrap_or(last);
+        let mid = (g.min_x + g.max_right) * 0.5;
+        let byte = if x < mid { g.start } else { g.end };
+        Some(Hit::CharOffset(byte))
     }
 
     fn hit_span(&self, point: Point) -> Option<usize> {
@@ -392,38 +449,64 @@ impl core::text::Paragraph for Paragraph {
 
         let run = self.internal().buffer.layout_runs().nth(line)?;
 
-        // index represents a grapheme, not a glyph
-        // Let's find the first glyph for the given grapheme cluster
-        let mut last_start = None;
-        let mut last_grapheme_count = 0;
-        let mut graphemes_seen = 0;
+        if run.glyphs.is_empty() {
+            return Some(Point::ORIGIN);
+        }
 
-        let glyph = run
-            .glyphs
-            .iter()
-            .find(|glyph| {
-                if Some(glyph.start) != last_start {
-                    last_grapheme_count = run.text[glyph.start..glyph.end].graphemes(false).count();
-                    last_start = Some(glyph.start);
-                    graphemes_seen += last_grapheme_count;
-                }
+        let first_glyph = &run.glyphs[0];
+        let last_glyph = run.glyphs.last().unwrap();
 
-                graphemes_seen >= index
-            })
-            .or_else(|| run.glyphs.last())?;
+        // Caret at the very start of the run.
+        if index == 0 {
+            let x = first_glyph.x + first_glyph.x_offset * first_glyph.font_size;
+            return Some(Point::new(
+                x / self.0.hint_factor,
+                (first_glyph.y - first_glyph.y_offset * first_glyph.font_size)
+                    / self.0.hint_factor,
+            ));
+        }
 
-        let advance = if index == 0 {
-            0.0
-        } else {
-            glyph.w
-                * (1.0
-                    - graphemes_seen.saturating_sub(index) as f32
-                        / last_grapheme_count.max(1) as f32)
+        let mut graphemes = run.text.grapheme_indices(true);
+        let target = graphemes.nth(index - 1);
+
+        let Some((g_start_byte, g_str)) = target else {
+            let right = last_glyph.x
+                + last_glyph.x_offset * last_glyph.font_size
+                + last_glyph.w;
+            return Some(Point::new(
+                right / self.0.hint_factor,
+                (last_glyph.y - last_glyph.y_offset * last_glyph.font_size)
+                    / self.0.hint_factor,
+            ));
         };
+        let g_end_byte = g_start_byte + g_str.len();
+
+        let mut max_right = f32::NEG_INFINITY;
+        let mut anchor_glyph = first_glyph;
+        for glyph in run.glyphs.iter() {
+            if glyph.start < g_end_byte && glyph.end > g_start_byte {
+                let right =
+                    glyph.x + glyph.x_offset * glyph.font_size + glyph.w;
+                if right > max_right {
+                    max_right = right;
+                    anchor_glyph = glyph;
+                }
+            }
+        }
+        if !max_right.is_finite() {
+            let x = first_glyph.x + first_glyph.x_offset * first_glyph.font_size;
+            return Some(Point::new(
+                x / self.0.hint_factor,
+                (first_glyph.y
+                    - first_glyph.y_offset * first_glyph.font_size)
+                    / self.0.hint_factor,
+            ));
+        }
 
         Some(Point::new(
-            (glyph.x + glyph.x_offset * glyph.font_size + advance) / self.0.hint_factor,
-            (glyph.y - glyph.y_offset * glyph.font_size) / self.0.hint_factor,
+            max_right / self.0.hint_factor,
+            (anchor_glyph.y - anchor_glyph.y_offset * anchor_glyph.font_size)
+                / self.0.hint_factor,
         ))
     }
 }
